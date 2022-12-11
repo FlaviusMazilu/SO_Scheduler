@@ -11,6 +11,7 @@
 tid_t create_new_tid();
 
 sem_t micunealta;
+int cuanta_default;
 
 enum Thread_state {
     BLOCKED,
@@ -23,7 +24,6 @@ typedef struct so_task {
     enum Thread_state state;
     tid_t task_id;
     int priority;
-    // pthread_cond_t cond;
     sem_t sem;
     so_handler *func;
     int cuanta;
@@ -41,6 +41,7 @@ typedef struct scheduler {
     int max_io_devices;
     so_queue_t so_queue;
     char number_of_instances;
+    so_queue_t all_threads;
 } scheduler_t;
 
 scheduler_t scheduler;
@@ -62,13 +63,17 @@ DECL_PREFIX int so_init(unsigned int time_quantum, unsigned int io)
     if (time_quantum == 0)
         return -1;
 
+    cuanta_default = time_quantum;
+
     scheduler.max_io_devices = io;
     scheduler.time_quantum = time_quantum;
     scheduler.so_queue.max_priority = -1;
     
     scheduler.so_queue.array = calloc(MAX_NR_THREADS, sizeof(so_task_t*));
         DIE(!scheduler.so_queue.array, "so_init malloc");
-    
+
+    scheduler.all_threads.array = calloc(MAX_NR_THREADS, sizeof(so_task_t*));
+        DIE(!scheduler.all_threads.array, "so_init malloc");
     sem_init(&micunealta, 0, 0);
 
     return 0;
@@ -97,13 +102,27 @@ void add_to_queue(so_task_t *task_to_add) {
     scheduler.so_queue.nr_elems++;
 
 }
+
+void requeue(so_task_t *task_to_remove, int pos)
+{
+
+    if (pos >= 0) {
+        for (int j = pos; j < scheduler.so_queue.nr_elems - 1; j++) {
+            scheduler.so_queue.array[j] = scheduler.so_queue.array[j + 1];
+        }
+        scheduler.so_queue.nr_elems--;
+        add_to_queue(task_to_remove);
+    }
+
+}
+
 #define NOT_PREEMPTED 60
 so_task_t* check_scheduler(pthread_t aux) {
 
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
-        if (scheduler.so_queue.array[i]->state != BLOCKED) {
+        if (scheduler.so_queue.array[i]->state == READY) {
             // do some magic and run that thread
-            // scheduler.so_queue.array[i]->func(scheduler.so_queue.array[i]->priority);
+            
             if (aux == scheduler.so_queue.array[i]->task_id) {
                 return NULL;
             }
@@ -146,11 +165,13 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     new_task->func = func;
     new_task->priority = priority;
     new_task->state = READY;
+    
+    new_task->cuanta = cuanta_default;
 
     sem_init(&new_task->sem, 0, 0);
 
     add_to_queue(new_task);
-
+    scheduler.all_threads.array[scheduler.all_threads.nr_elems++] = new_task;
     int rc = pthread_create(&(new_task->task_id), NULL, start_thread, new_task);
     sem_wait(&micunealta);
 
@@ -158,16 +179,29 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     so_task_t *current_task = NULL;
     tid_t my_tid = pthread_self();
 
+    int pos = -1;
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         if (my_tid == scheduler.so_queue.array[i]->task_id) {
             current_task = scheduler.so_queue.array[i];
+            pos = i;
             break;
         }
     }
+
+    if (current_task)
+        current_task->cuanta--;
+    
+    if (current_task != NULL && current_task->cuanta <= 0) {
+        current_task->cuanta = cuanta_default;
+        requeue(current_task, pos);
+    }
+
     so_task_t *res = check_scheduler(my_tid);
+    
     if (res != NULL) {
         sem_post(&(res->sem));
         if (current_task) {
+            current_task->cuanta = cuanta_default;
             sem_wait(&(current_task->sem));
         }
     }
@@ -175,12 +209,42 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
    return new_task->task_id;
 }
 
+DECL_PREFIX void so_exec(void)
+{
+    tid_t my_tid = pthread_self();
+    so_task_t *current_task;
+    int pos = -1;
+    for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
+        if (my_tid == scheduler.so_queue.array[i]->task_id) {
+            current_task = scheduler.so_queue.array[i];
+            pos = i;
+            break;
+        }
+    }
 
+    if (current_task)
+        current_task->cuanta--;
+    
+    if (current_task != NULL && current_task->cuanta <= 0) {
+        current_task->cuanta = cuanta_default;
+        requeue(current_task, pos);
+    }
+
+    so_task_t *res = check_scheduler(my_tid);
+    if (res != NULL) {
+        sem_post(&(res->sem));
+        if (current_task) {
+            current_task->cuanta = cuanta_default;
+            sem_wait(&(current_task->sem));
+        }
+    }
+
+}
 
 DECL_PREFIX void so_end(void)
 {
-    for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
-        pthread_join(scheduler.so_queue.array[i]->task_id, NULL);
+    for (int i = 0; i < scheduler.all_threads.nr_elems; i++) {
+        pthread_join(scheduler.all_threads.array[i]->task_id, NULL);
     }
 
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
@@ -189,18 +253,15 @@ DECL_PREFIX void so_end(void)
     }
 
     free(scheduler.so_queue.array);
+    free(scheduler.all_threads.array);
 
     if (scheduler.number_of_instances > 0)
         scheduler.number_of_instances--;
-    // free(&micunealta);
+    
     sem_destroy(&micunealta);
     
 }
 
-DECL_PREFIX void so_exec(void)
-{
-
-}
 
 DECL_PREFIX int so_signal(unsigned int io)
 {
