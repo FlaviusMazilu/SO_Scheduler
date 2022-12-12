@@ -22,9 +22,8 @@ MEMCHECK="valgrind --leak-check=full \
         --vex-iropt-register-updates=allregs-at-mem-access \
         --show-leak-kinds=all \
         --error-exitcode=$MEMCHECK_ERR_CODE \
-        $MEMCHECK_EXTRA
-        "
-        # --log-file=_log 
+        $MEMCHECK_EXTRA \
+        --log-file=_log "
 
 check_source()
 {
@@ -153,7 +152,6 @@ test_sched()
     if [ "$skip_memcheck" = "true" ]; then
         timeout $timeout ./_test/"$script" $test_index &> /dev/null
     else
-        $MEMCHECK ./_test/"$script" $test_index &>> /tmp/herex2
         timeout $timeout $MEMCHECK ./_test/"$script" $test_index &> /dev/null
     fi
 

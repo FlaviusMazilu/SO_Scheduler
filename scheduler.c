@@ -25,6 +25,8 @@ typedef struct so_task {
     tid_t task_id;
     int priority;
     sem_t sem;
+    sem_t semIO;
+    int IO_id;
     so_handler *func;
     int cuanta;
 } so_task_t;
@@ -45,13 +47,6 @@ typedef struct scheduler {
 } scheduler_t;
 
 scheduler_t scheduler;
-
-int get_thread_to_run(so_task_t *task)
-{
-    int rc;
-    rc = pthread_create(&(task->task_id), NULL, task->func, NULL);
-    return rc;
-}
 
 DECL_PREFIX int so_init(unsigned int time_quantum, unsigned int io)
 {  
@@ -165,10 +160,11 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     new_task->func = func;
     new_task->priority = priority;
     new_task->state = READY;
-    
+    new_task->IO_id = -1;
     new_task->cuanta = cuanta_default;
 
     sem_init(&new_task->sem, 0, 0);
+    sem_init(&new_task->semIO, 0, 0);
 
     add_to_queue(new_task);
     scheduler.all_threads.array[scheduler.all_threads.nr_elems++] = new_task;
@@ -249,6 +245,7 @@ DECL_PREFIX void so_end(void)
 
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         sem_destroy((&scheduler.so_queue.array[i]->sem));
+        sem_destroy(&(scheduler.so_queue.array[i]->semIO));
         free(scheduler.so_queue.array[i]);
     }
 
@@ -265,11 +262,90 @@ DECL_PREFIX void so_end(void)
 
 DECL_PREFIX int so_signal(unsigned int io)
 {
-    return 0;
+    if (io >= scheduler.max_io_devices)
+        return -1;
+    
+    tid_t myself = pthread_self();
+    so_task_t *current_task;
+    so_task_t *task_to_wake;
+    int pos = -1;
+    for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
+        if (scheduler.so_queue.array[i]->task_id == myself) {
+            current_task = scheduler.so_queue.array[i];
+            pos = i;
+            break;
+        }
+    }
+    int nr_threads_waken = 0;
+    for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
+        if (scheduler.so_queue.array[i]->IO_id == io) {
+            task_to_wake = scheduler.so_queue.array[i];
+
+            task_to_wake->IO_id = -1;
+            task_to_wake->state = READY;
+            nr_threads_waken++;
+            // sem_post(&(task_to_wake->semIO));
+        }
+    }
+
+    if (current_task)
+        current_task->cuanta--;
+    
+    if (current_task != NULL && current_task->cuanta <= 0) {
+        current_task->cuanta = cuanta_default;
+        requeue(current_task, pos);
+    }
+
+    so_task_t *res = check_scheduler(myself);
+    if (res != NULL) {
+        sem_post(&(res->sem));
+        if (current_task) {
+            current_task->cuanta = cuanta_default;
+            sem_wait(&(current_task->sem));
+        }
+    }
+
+    return nr_threads_waken;
 }
 
 DECL_PREFIX int so_wait(unsigned int io)
 {
+    if (io >= scheduler.max_io_devices)
+        return -1;
+    tid_t myself = pthread_self();
+    so_task_t *current_task;
+    int pos = -1;
+    for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
+        if (scheduler.so_queue.array[i]->task_id == myself) {
+            current_task = scheduler.so_queue.array[i];
+            pos = i;
+            break;
+        }
+    }
+    if (current_task) {
+        current_task->IO_id = io;
+        current_task->state = WAITING;
+    }
+
+    // sem_wait(&(current_task->semIO));
+    
+    if (current_task)
+        current_task->cuanta--;
+    
+    if (current_task != NULL && current_task->cuanta <= 0) {
+        current_task->cuanta = cuanta_default;
+        requeue(current_task, pos);
+    }
+
+    so_task_t *res = check_scheduler(myself);
+    if (res != NULL) {
+        sem_post(&(res->sem));
+        if (current_task) {
+            current_task->cuanta = cuanta_default;
+            sem_wait(&(current_task->sem));
+        }
+    }
+
     return 0;
 }
 
