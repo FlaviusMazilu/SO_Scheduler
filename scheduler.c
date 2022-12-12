@@ -1,5 +1,5 @@
-#include "util/so_scheduler.h"
-#include "my_header.h"
+#include "so_scheduler.h"
+#include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -25,7 +25,6 @@ typedef struct so_task {
     tid_t task_id;
     int priority;
     sem_t sem;
-    sem_t semIO;
     int IO_id;
     so_handler *func;
     int cuanta;
@@ -58,15 +57,17 @@ DECL_PREFIX int so_init(unsigned int time_quantum, unsigned int io)
     if (time_quantum == 0)
         return -1;
 
+    // saves the initial time quantum in a global variable
     cuanta_default = time_quantum;
 
     scheduler.max_io_devices = io;
     scheduler.time_quantum = time_quantum;
     scheduler.so_queue.max_priority = -1;
     
+    // so_queue.array= the threads in the priority queue
     scheduler.so_queue.array = calloc(MAX_NR_THREADS, sizeof(so_task_t*));
         DIE(!scheduler.so_queue.array, "so_init malloc");
-
+    // saves all the threads even the ones finished
     scheduler.all_threads.array = calloc(MAX_NR_THREADS, sizeof(so_task_t*));
         DIE(!scheduler.all_threads.array, "so_init malloc");
     sem_init(&micunealta, 0, 0);
@@ -98,6 +99,8 @@ void add_to_queue(so_task_t *task_to_add) {
 
 }
 
+// function used to put the preempted(for expiring time quantum) task in the right order
+// in the queue
 void requeue(so_task_t *task_to_remove, int pos)
 {
 
@@ -111,7 +114,10 @@ void requeue(so_task_t *task_to_remove, int pos)
 
 }
 
-#define NOT_PREEMPTED 60
+// function used to check which thread should be running next
+// is called after every instruction
+// @return: NULL if the current thread should continue his execution, else the scheduled task
+// is returned
 so_task_t* check_scheduler(pthread_t aux) {
 
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
@@ -121,7 +127,6 @@ so_task_t* check_scheduler(pthread_t aux) {
             if (aux == scheduler.so_queue.array[i]->task_id) {
                 return NULL;
             }
-            // sem_post(&(scheduler.so_queue.array[i]->sem));
             return scheduler.so_queue.array[i];
         }
 
@@ -129,6 +134,9 @@ so_task_t* check_scheduler(pthread_t aux) {
     return NULL;
 
 }
+
+// wrapper for starting a thread, puts in on hold until its notified it can start executing
+// the first instruction. A thread is done executing if his actual function handler returned 
 void* start_thread(void *arg) {
     sem_post(&micunealta);
 
@@ -157,6 +165,7 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
         perror("so_fork");
         return -1;
     }
+    // makes the initializations for the structure of the new thread
     new_task->func = func;
     new_task->priority = priority;
     new_task->state = READY;
@@ -164,7 +173,6 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     new_task->cuanta = cuanta_default;
 
     sem_init(&new_task->sem, 0, 0);
-    sem_init(&new_task->semIO, 0, 0);
 
     add_to_queue(new_task);
     scheduler.all_threads.array[scheduler.all_threads.nr_elems++] = new_task;
@@ -175,6 +183,7 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     so_task_t *current_task = NULL;
     tid_t my_tid = pthread_self();
 
+    // find the current task and it's position in the queue based on its tid
     int pos = -1;
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         if (my_tid == scheduler.so_queue.array[i]->task_id) {
@@ -183,7 +192,7 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
             break;
         }
     }
-
+    // in each instruction decrements the quantum
     if (current_task)
         current_task->cuanta--;
     
@@ -193,7 +202,8 @@ DECL_PREFIX tid_t so_fork(so_handler *func, unsigned int priority)
     }
 
     so_task_t *res = check_scheduler(my_tid);
-    
+    // if the scheduled thread is not the current one, wake up the specific thread and
+    // resets the current thread's quantum & waits
     if (res != NULL) {
         sem_post(&(res->sem));
         if (current_task) {
@@ -239,13 +249,13 @@ DECL_PREFIX void so_exec(void)
 
 DECL_PREFIX void so_end(void)
 {
+    // joins all the threads
     for (int i = 0; i < scheduler.all_threads.nr_elems; i++) {
         pthread_join(scheduler.all_threads.array[i]->task_id, NULL);
     }
 
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         sem_destroy((&scheduler.so_queue.array[i]->sem));
-        sem_destroy(&(scheduler.so_queue.array[i]->semIO));
         free(scheduler.so_queue.array[i]);
     }
 
@@ -268,6 +278,8 @@ DECL_PREFIX int so_signal(unsigned int io)
     tid_t myself = pthread_self();
     so_task_t *current_task;
     so_task_t *task_to_wake;
+
+    // finds the position of the current task in the queue
     int pos = -1;
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         if (scheduler.so_queue.array[i]->task_id == myself) {
@@ -276,6 +288,8 @@ DECL_PREFIX int so_signal(unsigned int io)
             break;
         }
     }
+    // goes to the queue and tests if any of them are waiting for the io with the id io
+    // if true, resets its IO_id and change their state from WAITING to READY
     int nr_threads_waken = 0;
     for (int i = 0; i < scheduler.so_queue.nr_elems; i++) {
         if (scheduler.so_queue.array[i]->IO_id == io) {
@@ -284,7 +298,6 @@ DECL_PREFIX int so_signal(unsigned int io)
             task_to_wake->IO_id = -1;
             task_to_wake->state = READY;
             nr_threads_waken++;
-            // sem_post(&(task_to_wake->semIO));
         }
     }
 
@@ -322,12 +335,13 @@ DECL_PREFIX int so_wait(unsigned int io)
             break;
         }
     }
+
+    // puts the thread in the waiting state and sets the id io he is waiting for
     if (current_task) {
         current_task->IO_id = io;
         current_task->state = WAITING;
     }
 
-    // sem_wait(&(current_task->semIO));
     
     if (current_task)
         current_task->cuanta--;
